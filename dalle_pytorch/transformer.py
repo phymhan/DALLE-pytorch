@@ -11,6 +11,9 @@ from dalle_pytorch.attention import Attention, SparseAttention, SparseConvCausal
 
 from g_mlp_pytorch import gMLPBlock
 
+import pdb
+st = pdb.set_trace
+
 # helpers
 
 def exists(val):
@@ -49,6 +52,7 @@ class LayerScale(nn.Module):
         scale = torch.zeros(1, 1, dim).fill_(init_eps)
         self.scale = nn.Parameter(scale)
         self.fn = fn
+
     def forward(self, x, **kwargs):
         return self.fn(x, **kwargs) * self.scale
 

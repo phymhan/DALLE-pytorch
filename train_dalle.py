@@ -14,6 +14,9 @@ from dalle_pytorch import distributed_utils
 from dalle_pytorch.loader import TextImageDataset
 from dalle_pytorch.tokenizer import tokenizer, HugTokenizer, ChineseTokenizer, YttmTokenizer
 
+import pdb
+st = pdb.set_trace
+
 # argument parsing
 
 parser = argparse.ArgumentParser()
@@ -78,6 +81,8 @@ train_group.add_argument('--clip_grad_norm', default = 0.5, type = float, help =
 
 train_group.add_argument('--lr_decay', dest = 'lr_decay', action = 'store_true')
 
+train_group.add_argument('--freeze_transformer', action = 'store_true')
+
 model_group = parser.add_argument_group('Model settings')
 
 model_group.add_argument('--dim', default = 512, type = int, help = 'Model dimension')
@@ -95,6 +100,8 @@ model_group.add_argument('--reversible', dest = 'reversible', action='store_true
 model_group.add_argument('--loss_img_weight', default = 7, type = int, help = 'Image loss weight')
 
 model_group.add_argument('--attn_types', default = 'full', type = str, help = 'comma separated list of attention types. attention type can be: full or sparse or axial_row or axial_col or conv_like.')
+
+model_group.add_argument('--pretrained_transformer', type=str, default='none')
 
 args = parser.parse_args()
 
@@ -227,6 +234,8 @@ else:
         reversible=REVERSIBLE,
         loss_img_weight=LOSS_IMG_WEIGHT,
         attn_types=ATTN_TYPES,
+        pretrained_transformer=args.pretrained_transformer,
+        freeze_transformer=args.freeze_transformer,
     )
 
 # configure OpenAI VAE for float16s

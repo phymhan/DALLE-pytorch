@@ -22,6 +22,9 @@ from einops import rearrange
 
 from dalle_pytorch import distributed_utils
 
+import pdb
+st = pdb.set_trace
+
 # constants
 
 CACHE_PATH = os.path.expanduser("~/.cache/dalle")

@@ -10,6 +10,10 @@ from dalle_pytorch import distributed_utils
 from dalle_pytorch.vae import OpenAIDiscreteVAE
 from dalle_pytorch.vae import VQGanVAE1024
 from dalle_pytorch.transformer import Transformer, DivideMax
+from dalle_pytorch.transformers.vqgan_transformer import VQGanTransformer
+
+import pdb
+st = pdb.set_trace
 
 # helpers
 
@@ -322,7 +326,9 @@ class DALLE(nn.Module):
         sparse_attn = False,
         attn_types = None,
         loss_img_weight = 7,
-        stable = False
+        stable = False,
+        pretrained_transformer = 'none',
+        freeze_transformer = False,
     ):
         super().__init__()
         assert isinstance(vae, (DiscreteVAE, OpenAIDiscreteVAE, VQGanVAE1024)), 'vae must be an instance of DiscreteVAE'
@@ -354,21 +360,27 @@ class DALLE(nn.Module):
         self.vae = vae
         set_requires_grad(self.vae, False) # freeze VAE from being trained
 
-        self.transformer = Transformer(
-            dim = dim,
-            causal = True,
-            seq_len = seq_len,
-            depth = depth,
-            heads = heads,
-            dim_head = dim_head,
-            reversible = reversible,
-            attn_dropout = attn_dropout,
-            ff_dropout = ff_dropout,
-            attn_types = attn_types,
-            image_fmap_size = image_fmap_size,
-            sparse_attn = sparse_attn,
-            stable = stable
-        )
+        self.pretrained_transformer = pretrained_transformer
+        if pretrained_transformer == 'vqgan':
+            self.transformer = VQGanTransformer()
+            if freeze_transformer:
+                set_requires_grad(self.transformer, False)
+        elif pretrained_transformer == 'none':
+            self.transformer = Transformer(
+                dim = dim,
+                causal = True,
+                seq_len = seq_len,
+                depth = depth,
+                heads = heads,
+                dim_head = dim_head,
+                reversible = reversible,
+                attn_dropout = attn_dropout,
+                ff_dropout = ff_dropout,
+                attn_types = attn_types,
+                image_fmap_size = image_fmap_size,
+                sparse_attn = sparse_attn,
+                stable = stable
+            )
 
         self.stable = stable
 
