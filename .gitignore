@@ -138,3 +138,6 @@ dmypy.json
 ./dataset
 ./data
 ./dalle-ds-cp
+./logs*
+
+.vscode
