@@ -13,6 +13,9 @@ from dalle_pytorch import OpenAIDiscreteVAE, VQGanVAE1024, DiscreteVAE, DALLE
 from dalle_pytorch import distributed_utils
 from dalle_pytorch.loader import TextImageDataset
 from dalle_pytorch.tokenizer import tokenizer, HugTokenizer, ChineseTokenizer, YttmTokenizer
+import utils
+import os
+import torchvision
 
 import pdb
 st = pdb.set_trace
@@ -47,7 +50,7 @@ parser.add_argument('--hug', dest='hug', action='store_true')
 parser.add_argument('--bpe_path', type=str,
                     help='path to your BPE json file')
 
-parser.add_argument('--dalle_output_file_name', type=str, default = "dalle",
+parser.add_argument('--dalle_output_file_name', type=str, default = "logs/dalle_train_transformer/dalle",
                     help='output_file_name')
 
 parser.add_argument('--fp16', action='store_true',
@@ -62,6 +65,8 @@ parser.add_argument(
 
 parser.add_argument('--wandb_name', default='dalle_train_transformer',
                     help='Name W&B will use when saving results.\ne.g. `--wandb_name "coco2017-full-sparse"`')
+
+parser.add_argument('--name', default='dalle_train_transformer', help='experiment name, if not using wandb')
 
 parser = distributed_utils.wrap_arg_parser(parser)
 
@@ -82,6 +87,18 @@ train_group.add_argument('--clip_grad_norm', default = 0.5, type = float, help =
 train_group.add_argument('--lr_decay', dest = 'lr_decay', action = 'store_true')
 
 train_group.add_argument('--freeze_transformer', action = 'store_true')
+
+train_group.add_argument('--wandb', action = 'store_true', help = 'use wandb logging')
+
+train_group.add_argument("--log_root", type=str, help="where to save training logs", default='logs')
+
+train_group.add_argument("--log_every", type=int, default=100, help="logging every # iters")
+
+train_group.add_argument("--sample_every", type=int, default=100, help="sample every # iters")
+
+train_group.add_argument('--n_sample', default = 4, type = int, help = 'Number of samples to visualize')
+
+train_group.add_argument('--seed', default = 42, type = int, help = 'Random seed')
 
 model_group = parser.add_argument_group('Model settings')
 
@@ -131,7 +148,10 @@ def cp_path_to_dir(cp_path, tag):
 
 # constants
 
-DALLE_OUTPUT_FILE_NAME = args.dalle_output_file_name + ".pt"
+WANDB = args.wandb
+
+# if not using wandb or deepspeed, checkpointing to subdirs
+CKPTING_SUBDIR = not args.wandb and not args.deepspeed
 
 VAE_PATH = args.vae_path
 DALLE_PATH = args.dalle_path
@@ -156,6 +176,27 @@ LOSS_IMG_WEIGHT = args.loss_img_weight
 ATTN_TYPES = tuple(args.attn_types.split(','))
 
 DEEPSPEED_CP_AUX_FILENAME = 'auxiliary.pt'
+
+# logging
+
+if WANDB:
+    args.name = args.wandb_name
+args.log_dir = Path(args.log_root) / args.name
+os.makedirs(args.log_dir, exist_ok=True)
+os.makedirs(args.log_dir / 'samples', exist_ok=True)
+os.makedirs(args.log_dir / 'weights', exist_ok=True)
+LOG_DIR = args.log_dir
+LOG_SAMPLE_DIR = args.log_dir / 'samples'
+LOG_FILE_NAME = args.log_dir / 'log.txt'
+
+if WANDB:  # if use wandb, log_dir can still be customized by args.dalle_output_file_name
+    DALLE_OUTPUT_FILE_NAME = args.dalle_output_file_name + ".pt"
+else:
+    DALLE_OUTPUT_FILE_NAME = args.log_dir / 'weights' / 'dalle.pt'
+
+# print args and set random seed
+utils.print_args(parser, args)
+utils.seed_everything(args.seed)
 
 # initialize distributed backend
 
@@ -291,12 +332,12 @@ dl = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=is_shuffle, drop_last=True, s
 
 # initialize DALL-E
 
-
 dalle = DALLE(vae=vae, **dalle_params)
 if not using_deepspeed:
     if args.fp16:
         dalle = dalle.half()
     dalle = dalle.cuda()
+utils.print_models(dalle, args)
 
 if RESUME and not using_deepspeed:
     dalle.load_state_dict(weights)
@@ -325,11 +366,12 @@ if distr_backend.is_root_worker():
         dim_head=DIM_HEAD
     )
 
-    run = wandb.init(
-        project=args.wandb_name,  # 'dalle_train_transformer' by default
-        resume=RESUME,
-        config=model_config,
-    )
+    if WANDB:
+        run = wandb.init(
+            project=args.wandb_name,  # 'dalle_train_transformer' by default
+            resume=RESUME,
+            config=model_config,
+        )
 
 # distribute
 
@@ -369,7 +411,8 @@ if RESUME and using_deepspeed:
     distr_dalle.load_checkpoint(str(cp_dir))
 
 
-def save_model(path):
+def save_model(path, subdir=''):
+    path = path.parent / subdir / path.name  # subdir specifies which epoch or iter
     save_obj = {
         'hparams': dalle_params,
         'vae_params': vae_params,
@@ -404,20 +447,30 @@ def save_model(path):
         **save_obj,
         'weights': dalle.state_dict()
     }
-
+    os.makedirs(path.parent, exist_ok=True)
     torch.save(save_obj, path)
 
 # training
 
 # Saves a checkpoint before training begins to fail early when mis-configured. 
 # See https://github.com/lucidrains/DALLE-pytorch/wiki/DeepSpeed-Checkpoints
-save_model(DALLE_OUTPUT_FILE_NAME)
+save_model(DALLE_OUTPUT_FILE_NAME, f"iter_{0:07d}" if CKPTING_SUBDIR else '')
+
+total_iter = -1
+if distr_backend.is_root_worker():
+    with open(LOG_FILE_NAME, 'a+') as f:
+        f.write(f"Name: {getattr(args, 'name', 'NA')}\n{'-'*50}\n")
 
 for epoch in range(EPOCHS):
+    which_epoch = f"epoch_{epoch:04d}"
     if data_sampler:
         data_sampler.set_epoch(epoch)
+
     for i, (text, images) in enumerate(distr_dl):
-        if i % 10 == 0 and distr_backend.is_root_worker():
+        total_iter += 1
+        which_iter = f"iter_{total_iter:07d}"
+
+        if i % args.log_every == 0 and distr_backend.is_root_worker():
             t = time.time()
         if args.fp16:
             images = images.half()
@@ -440,7 +493,7 @@ for epoch in range(EPOCHS):
 
         log = {}
 
-        if i % 10 == 0 and distr_backend.is_root_worker():
+        if i % args.log_every == 0 and distr_backend.is_root_worker():
             print(epoch, i, f'loss - {avg_loss.item()}')
 
             log = {
@@ -450,33 +503,57 @@ for epoch in range(EPOCHS):
                 'loss': avg_loss.item()
             }
 
+            # if not WANDB:
+            with open(LOG_FILE_NAME, 'a+') as f:
+                # f.write(f"{'; '.join([f'{k}: {log[k]:.4f}' for k in log])}; \n")
+                f.write(
+                    (
+                        f"epoch {epoch:04d}; "
+                        f"iter {i:07d}; "
+                        f"loss {avg_loss.item():.4f}; "
+                        f"\n"
+                    )
+                )
+
         if i % SAVE_EVERY_N_STEPS == 0:
-            save_model(DALLE_OUTPUT_FILE_NAME)
-	
-        if i % 100 == 0:
+            save_model(DALLE_OUTPUT_FILE_NAME, which_iter if CKPTING_SUBDIR else '')
+
+        if i % args.sample_every == 0:
             if distr_backend.is_root_worker():
-                sample_text = text[:1]
-                token_list = sample_text.masked_select(sample_text != 0).tolist()
-                decoded_text = tokenizer.decode(token_list)
-
-                if not avoid_model_calls:
-                    # CUDA index errors when we don't guard this
-                    image = dalle.generate_images(text[:1], filter_thres=0.9)  # topk sampling at 0.9
-
+                sample_imgs = []
+                sample_txts = []
+                if not avoid_model_calls:  # CUDA index errors when we don't guard this
+                    for j in range(args.n_sample):
+                        sample_text = text[j:j+1]
+                        token_list = sample_text.masked_select(sample_text != 0).tolist()
+                        decoded_text = tokenizer.decode(token_list)
+                        image = dalle.generate_images(text[j:j+1], filter_thres=0.9)  # topk sampling at 0.9
+                        sample_imgs.append(image)
+                        sample_txts.append(f'{j+1}. {decoded_text}')
 
                 log = {
                     **log,
                 }
                 if not avoid_model_calls:
-                    log['image'] = wandb.Image(image, caption=decoded_text)
+                    if WANDB:
+                        log['image'] = wandb.Image(image, caption=decoded_text)
+                    else:
+                        torchvision.utils.save_image(
+                            torch.cat(sample_imgs),
+                            LOG_SAMPLE_DIR / f'{which_iter}.png',
+                            nrow=args.n_sample,
+                            normalize=True,
+                            value_range=(0, 1)
+                        )
+                        with open(LOG_SAMPLE_DIR / f'{which_iter}.txt', 'w') as f:
+                            f.write('\n'.join(sample_txts))
 
-
-        if i % 10 == 9 and distr_backend.is_root_worker():
+        if i % args.log_every == args.log_every - 1 and distr_backend.is_root_worker():
             sample_per_sec = BATCH_SIZE * 10 / (time.time() - t)
             log["sample_per_sec"] = sample_per_sec
-            print(epoch, i, f'sample_per_sec - {sample_per_sec}')
+            print(epoch, i, f'sample_per_sec - {sample_per_sec:.2f}')
 
-        if distr_backend.is_root_worker():
+        if WANDB and distr_backend.is_root_worker():
             wandb.log(log)
 
     if LR_DECAY and not using_deepspeed:
@@ -484,20 +561,25 @@ for epoch in range(EPOCHS):
         # using DeepSpeed.
         distr_scheduler.step(avg_loss)
 
-    save_model(DALLE_OUTPUT_FILE_NAME)
-    
-    if distr_backend.is_root_worker():
-        # save trained model to wandb as an artifact every epoch's end
+    save_model(DALLE_OUTPUT_FILE_NAME, which_epoch if CKPTING_SUBDIR else '')
 
+    if distr_backend.is_root_worker():
+        if WANDB:
+            # save trained model to wandb as an artifact every epoch's end
+            model_artifact = wandb.Artifact('trained-dalle', type='model', metadata=dict(model_config))
+            model_artifact.add_file(DALLE_OUTPUT_FILE_NAME)
+            run.log_artifact(model_artifact)
+        else:
+            pass
+
+save_model(DALLE_OUTPUT_FILE_NAME, 'last' if CKPTING_SUBDIR else '')
+if distr_backend.is_root_worker():
+    if WANDB:
+        wandb.save(DALLE_OUTPUT_FILE_NAME)
         model_artifact = wandb.Artifact('trained-dalle', type='model', metadata=dict(model_config))
         model_artifact.add_file(DALLE_OUTPUT_FILE_NAME)
         run.log_artifact(model_artifact)
 
-save_model(DALLE_OUTPUT_FILE_NAME)
-if distr_backend.is_root_worker():
-    wandb.save(DALLE_OUTPUT_FILE_NAME)
-    model_artifact = wandb.Artifact('trained-dalle', type='model', metadata=dict(model_config))
-    model_artifact.add_file(DALLE_OUTPUT_FILE_NAME)
-    run.log_artifact(model_artifact)
-
-    wandb.finish()
+        wandb.finish()
+    else:
+        pass
